@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 'Read gestures from libinput touchpad and action shell commands.'
 # Mark Blakeney, Sep 2015
+# Leo Mao, Apr 2016
 import os, sys, argparse, subprocess, shlex, re, getpass, fcntl
 
 PROG = os.path.basename(sys.argv[0])
@@ -8,15 +9,19 @@ PROG = os.path.basename(sys.argv[0])
 # Conf file containing gesture commands
 CONF = os.path.expanduser('~/.config/{}.conf'.format(PROG))
 
+MOTIONS = ('left', 'right', 'up', 'down', 'in', 'out',
+           'clockwise', 'counter-clockwise')
+CMD_MAP = {}
+
 # Set up command line arguments
 opt = argparse.ArgumentParser(description=__doc__,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+                              formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 opt.add_argument('-c', '--conffile', default=CONF,
-        help='Gestures configuration file')
+                 help='Gestures configuration file')
 opt.add_argument('-v', '--verbose', action='store_true',
-        help='Output diagnostic messages')
+                 help='Output diagnostic messages')
 opt.add_argument('-d', '--debug', action='store_true',
-        help='Output diagnostic messages only, do not action gestures')
+                 help='Output diagnostic messages only, do not action gestures')
 args = opt.parse_args()
 
 if args.debug:
@@ -36,7 +41,7 @@ def open_lock(*args):
 def get_device():
     'Determine libinput touchpad device path'
     out = subprocess.check_output('libinput-list-devices',
-            universal_newlines=True)
+                                  universal_newlines=True)
 
     dev = None
     for line in out.splitlines():
@@ -63,29 +68,21 @@ class GESTURE:
     def __init__(self):
         'Initialise this gesture at program start'
         self.name = type(self).__name__
-        self.motions = {}
-
-    def add(self, motion, fingers, command):
-        'Add a configured motion command for this gesture'
-        if motion not in self.SUPPORTED_MOTIONS:
-            return None
-
-        if fingers:
-            self.motions[(motion, fingers)] = shlex.split(command)
-        else:
-            self.motions[motion] = shlex.split(command)
-
-        return self
+        self.done = False
 
     def action(self, motion):
         'Action a motion command for this gesture'
+        
+        if self.done:
+            return
 
-        command = self.motions.get((motion, self.fingers)) or \
-                self.motions.get(motion)
+        command = CMD_MAP.get((self.fingers, motion))
+        if command:
+            self.done = True
 
         if args.verbose:
             print('{}: {} {} {} {}'.format(PROG, self.name, motion,
-                self.fingers, self.data))
+                                           self.fingers, self.data))
             if command:
                 print('  {}'.format(command))
 
@@ -96,19 +93,8 @@ class SWIPE(GESTURE):
     'Class to handle this type of gesture'
     SUPPORTED_MOTIONS = ('left', 'right', 'up', 'down')
 
-    def begin(self, fingers):
-        'Initialise this gesture at the start of motion'
-        self.fingers = fingers
-        self.data = [0.0, 0.0]
-
-    def update(self, coords):
-        'Update this gesture for a motion'
-        self.data[0] += float(coords[2])
-        self.data[1] += float(coords[3])
-
-    def end(self):
-        'Action this gesture at the end of a motion sequence'
-        # Require movement beyond a small threshhold.
+    def check(self):
+        'Check if this gesture satifies a motion sequence'
         if abs(self.data[0] - self.data[1]) >= 70:
             if abs(self.data[0]) > abs(self.data[1]):
                 motion = 'left' if self.data[0] < 0 else 'right'
@@ -117,23 +103,62 @@ class SWIPE(GESTURE):
 
             self.action(motion)
 
+    def begin(self, fingers):
+        'Initialise this gesture at the start of motion'
+        self.fingers = fingers
+        self.done = False
+        self.data = [0.0, 0.0]
+
+    def update(self, coords):
+        'Update this gesture for a motion'
+        self.data[0] += float(coords[0])
+        self.data[1] += float(coords[1])
+        if not self.done:
+            self.check()
+
+    def end(self, cancelled):
+        pass
+
 class PINCH(GESTURE):
     'Class to handle this type of gesture'
-    SUPPORTED_MOTIONS = ('in', 'out')
+    SUPPORTED_MOTIONS = ('left', 'right', 'up', 'down', 'in', 'out', 'lturn', 'rturn')
+
+    def check(self):
+        'Check if this gesture satifies a motion sequence'
+        if abs(self.data[3]) > 30.0:
+            self.action('lturn' if self.data[3] < 0 else 'rturn')
+        if self.data[2] > 1.5 or self.data[2] < 1/1.5:
+            self.action('out' if self.data[2] > 1 else 'in')
+        if abs(abs(self.data[0]) - abs(self.data[1])) > 70.0:
+            if abs(self.data[0]) > abs(self.data[1]):
+                motion = 'left' if self.data[0] < 0 else 'right'
+            else:
+                motion = 'up' if self.data[1] < 0 else 'down'
+
+            self.action(motion)
 
     def begin(self, fingers):
         'Initialise this gesture at the start of motion'
         self.fingers = fingers
-        self.data = 0.0
+        self.done = False
+        self.orig = None
+        self.data = [0.0, 0.0, 0.0, 0.0]
 
     def update(self, coords):
         'Update this gesture for a motion'
-        self.data += 1.0 - float(coords[5])
+        self.data[0] += float(coords[0])
+        self.data[1] += float(coords[1])
+        self.data[3] += float(coords[3])
+        if not self.orig:
+            self.data[2] = float(coords[2])
+            self.orig = self.data[2]
+        else:
+            self.data[2] = float(coords[2]) / self.orig
+        if not self.done:
+            self.check()
 
-    def end(self):
-        'Action this gesture at the end of a motion sequence'
-        if self.data != 0.0:
-            self.action('in' if self.data >= 0.0 else 'out')
+    def end(self, cancelled):
+        pass
 
 # Create gesture handler instances and insert them in handler lookup
 # table based on their name.
@@ -148,26 +173,12 @@ def get_conf(conffile):
             if not line or line[0] == '#':
                 continue
 
-            key, data = line.split(maxsplit=1)
-
-            handler = None
-            if key == 'gesture:':
-                gesture, motion, command = data.split(maxsplit=2)
-                fingers, ncommand = command.split(maxsplit=1)
-                handler = handlers.get(gesture.upper())
-                if handler:
-                    count += 1
-
-                    # Gesture can be configured with optional specific
-                    # finger count
-                    if fingers.isdigit() and len(fingers) == 1:
-                        handler = handler.add(motion.lower(), fingers, ncommand)
-                    else:
-                        handler = handler.add(motion.lower(), None, command)
-
-            if not handler:
+            fingers, motion, command = line.split(maxsplit=2)
+            if fingers.isdigit() and len(fingers) == 1 and motion in MOTIONS:
+                CMD_MAP[(fingers, motion)] = shlex.split(command)
+            else:
                 print('Error in file {} for line:\n{}.'.format(conffile, line),
-                        file=sys.stderr)
+                      file=sys.stderr)
                 sys.exit(1)
 
     return count
@@ -177,7 +188,7 @@ user = getpass.getuser()
 proglock = open_lock(PROG, user)
 if not proglock:
     print('{} is already running for {}, terminating ..'.format(PROG, user),
-            file=sys.stderr)
+          file=sys.stderr)
     sys.exit(1)
 
 # Get touchpad device
@@ -188,45 +199,47 @@ count = get_conf(args.conffile)
 
 if args.verbose:
     print('{}: monitoring device {} for {} gestures'.format(PROG, device,
-        count))
+                                                            count))
 
 # Note your must "sudo gpasswd -a $USER input" then log out/in for
 # permission to access the device.
 command = 'stdbuf -oL -- libinput-debug-events --device {}'.format(device)
 
 cmd = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE,
-        universal_newlines=True, bufsize=0)
+                       universal_newlines=True, bufsize=0)
 
 # Sit in a loop forever reading the libinput debug output for GESTURES ..
 handler = None
 for line in cmd.stdout:
+    # events which are not GESTURE are usually used by the system.
     if 'GESTURE_' not in line:
         continue
 
     # Split debug line into relevant fields
     dev, gevent, time, other = line.strip().split(maxsplit=3)
-    gesture, event = gevent[8:].split('_')
+    gesture, event = gevent.split('_')[1:]
     if ' ' in other:
         fingers, params = other.split(maxsplit=1)
+        params = re.sub(r'\(.*\)', '', params)
     else:
         fingers, params = other, None
 
     # Action each type of event
     if event == 'UPDATE':
         if handler:
-            handler.update(re.split(r'[ (/@]+', params))
+            handler.update(re.split(r'[ /@]+', params))
     elif event == 'BEGIN':
         handler = handlers.get(gesture)
         if handler:
             handler.begin(fingers)
         else:
             print('Unknown gesture received: {}'.format(gesture),
-                    file=sys.stderr)
+                  file=sys.stderr)
     elif event == 'END':
         # Ignore gesture if final action is cancelled
-        if params != 'cancelled' and handler:
-            handler.end()
+        if handler:
+            handler.end(params == 'cancelled')
         handler = None
     else:
-        print('Unknown gesture + event received: {} + {}'.format(gesture,
-            event), file=sys.stderr)
+        print('Unknown gesture + event received: {}_{}'.format(gesture, event),
+              file=sys.stderr)

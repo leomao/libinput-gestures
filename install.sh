@@ -3,7 +3,7 @@
 # (C) Mark Blakeney, markb@berlios.de, Sep 2015.
 
 PROG="libinput-gestures"
-BINDIR="$HOME/bin"
+BINDIR="$HOME/.local/bin"
 APPDIR="$HOME/.local/share/applications"
 AUTDIR="$HOME/.config/autostart"
 
